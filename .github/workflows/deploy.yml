@@ -16,14 +16,8 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: '1.25.5'
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '18'
-
-      # --- 修改点：增加 --legacy-peer-deps 解决依赖冲突 ---
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
@@ -87,19 +81,18 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+          go-version: '1.25.5'
+          
+      - uses: oven-sh/setup-bun@v2
         with:
-          node-version: '18'
-
-      # --- 修改点：增加 --legacy-peer-deps 解决依赖冲突 ---
+          bun-version: latest
       - name: Build Frontend
+        env:
+          CI: ""
         run: |
           cd web
-          npm install --legacy-peer-deps
-          npm run build
+          bun install
+          DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$VERSION bun run build
           cd ..
 
       - name: Setup Zig
@@ -148,19 +141,18 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.25.5'
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: oven-sh/setup-bun@v2
         with:
-          node-version: '18'
-
-      # --- 修改点：增加 --legacy-peer-deps 解决依赖冲突 ---
+          bun-version: latest
       - name: Build Frontend
+        env:
+          CI: ""
         run: |
           cd web
-          npm install --legacy-peer-deps
-          npm run build
+          bun install
+          DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$VERSION bun run build
           cd ..
 
       - name: Build Binary (AMD64)
