@@ -5,10 +5,10 @@ on:
 
 jobs:
   # ======================================================================================
-  # 任务 1: 编译 Linux armhf (Musl/Static) -> 发送到 IPv4 服务器
-  # 场景：目标服务器 Glibc 极老，必须使用全静态编译
+  # 任务 1: 编译 Linux armhf (Musl/Static) -> 压缩传输 (加速)
+  # 修复：Gzip 压缩加速传输，解决电信跨国慢的问题
   # ======================================================================================
-  deploy-armhf-musl:
+  deploy-armhf:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -17,7 +17,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25.5' # 建议使用稳定版 1.25.5 或 1.23
+          go-version: '1.25.5'
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -37,25 +37,30 @@ jobs:
         with:
           version: master
 
-      # 关键修改：
-      # 1. CC 使用 musleabihf
-      # 2. ldflags 加入 "-linkmode external" 强制使用 Zig 进行链接，修复符号丢失问题
+      # 1. 编译静态文件
       - name: Build Binary (Armv7 Musl Static)
         run: |
           CGO_ENABLED=1 GOOS=linux GOARCH=arm GOARM=7 CC="zig cc -target arm-linux-musleabihf" \
           go build -tags musl -ldflags "-s -w -linkmode external -extldflags '-static'" -o new-api-main .
 
-      # 使用临时文件名避免覆盖错误
-      - name: Deploy to Server (IPv4)
+      # 2. 关键步骤：Gzip 压缩 (体积减小约 70%，极大加速 SCP)
+      - name: Compress Binary
+        run: |
+          gzip -9 new-api-main
+          ls -lh new-api-main.gz
+
+      # 3. 上传压缩包
+      - name: Deploy to Server (IPv4 - Compressed)
         uses: appleboy/scp-action@master
         with:
           host: ${{ secrets.HOST_ARMHF }}
           port: ${{ secrets.PORT_ARMHF }}
           username: root
           password: ${{ secrets.PASS_ARMHF }}
-          source: "new-api-main"
-          target: "/tmp/new-api-main-upload"
+          source: "new-api-main.gz"
+          target: "/tmp/"     # 直接传到 /tmp/ 目录下
 
+      # 4. 解压并重启
       - name: Restart Service
         uses: appleboy/ssh-action@master
         with:
@@ -65,15 +70,20 @@ jobs:
           password: ${{ secrets.PASS_ARMHF }}
           script: |
             systemctl stop newapi.service
-            # 移动覆盖
-            mv /tmp/new-api-main-upload /root/new-api/new-api-main
+            
+            # 解压并覆盖
+            cd /tmp
+            rm -f new-api-main # 清理旧的解压文件
+            gunzip -f new-api-main.gz
+            mv new-api-main /root/new-api/new-api-main
+            
             chmod +x /root/new-api/new-api-main
             systemctl restart newapi.service
-            echo "ARMHF IPv4 (Static Musl) Deployment Done!"
+            echo "ARMHF Deployment Done!"
 
   # ======================================================================================
-  # 任务 2: 编译 Linux arm64 -> 发送到 IPv6 单栈服务器
-  # 场景：WARP 环境下 appleboy/scp-action DNS 解析失败，改用原生命令
+  # 任务 2: 编译 Linux arm64 -> 解决 IPv6 解析失败问题
+  # 修复：手动解析 DNS 获取 IP，使用原生 SCP 传输
   # ======================================================================================
   deploy-arm64:
     runs-on: ubuntu-latest
@@ -103,7 +113,7 @@ jobs:
           bun install
           DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$VERSION bun run build
           cd ..
-          
+
       - name: Setup Zig
         uses: goto-bus-stop/setup-zig@v2
         with:
@@ -113,26 +123,41 @@ jobs:
         run: |
           CGO_ENABLED=1 GOOS=linux GOARCH=arm64 CC="zig cc -target aarch64-linux-gnu" \
           go build -ldflags "-s -w" -o new-api-arm64 .
+          # 同样压缩，虽然 IPv6 可能会快点，但压缩总是好的
+          gzip -9 new-api-arm64
 
-      # 修正：使用原生 scp + sshpass
-      - name: Deploy to Server (IPv6 Native)
+      # 关键修复：手动解析域名为 IPv6 地址，避免 ssh 无法解析
+      - name: Resolve IPv6 & Deploy
         run: |
-          sudo apt-get update && sudo apt-get install -y sshpass
-          # 1. 传输到 /tmp
-          sshpass -p "${{ secrets.PASS_ARM64 }}" scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P ${{ secrets.PORT_ARM64 }} new-api-arm64 root@${{ secrets.HOST_ARM64 }}:/tmp/new-api-arm64-upload
+          sudo apt-get update && sudo apt-get install -y sshpass dnsutils
           
-          # 2. SSH 执行替换和重启
-          sshpass -p "${{ secrets.PASS_ARM64 }}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p ${{ secrets.PORT_ARM64 }} root@${{ secrets.HOST_ARM64 }} "
+          # 强制获取 AAAA 记录 (IPv6)
+          SERVER_IP=$(dig +short AAAA ${{ secrets.HOST_ARM64 }} | tail -n1)
+          
+          if [ -z "$SERVER_IP" ]; then
+            echo "❌ Error: Could not resolve IPv6 address for host."
+            exit 1
+          fi
+          
+          echo "✅ Resolved IPv6: $SERVER_IP"
+          
+          # 使用 IP 地址进行 SCP
+          sshpass -p "${{ secrets.PASS_ARM64 }}" scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P ${{ secrets.PORT_ARM64 }} new-api-arm64.gz root@[$SERVER_IP]:/tmp/
+          
+          # 使用 IP 地址进行 SSH
+          sshpass -p "${{ secrets.PASS_ARM64 }}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p ${{ secrets.PORT_ARM64 }} root@[$SERVER_IP] "
             systemctl stop newapi.service
-            mv /tmp/new-api-arm64-upload /root/newapi/new-api-arm64-v0.9.27-patch.1
+            cd /tmp
+            gunzip -f new-api-arm64.gz
+            mv new-api-arm64 /root/newapi/new-api-arm64-v0.9.27-patch.1
             chmod +x /root/newapi/new-api-arm64-v0.9.27-patch.1
             systemctl restart newapi.service
             echo 'ARM64 IPv6 Deployment Done!'
           "
 
   # ======================================================================================
-  # 任务 3: 编译 Linux amd64 -> 发送到 IPv4 服务器
-  # 场景：解决 Text file busy
+  # 任务 3: 编译 Linux amd64 -> 解决路径错误
+  # 修复：Target 指向目录根，防止创建多余文件夹
   # ======================================================================================
   deploy-amd64:
     runs-on: ubuntu-latest
@@ -171,7 +196,8 @@ jobs:
           username: root
           password: ${{ secrets.PASS_AMD64 }}
           source: "new-api-amd64"
-          target: "/tmp/new-api-amd64-upload"
+          # 修复点：这里只写目录，不写自定义文件名，避免被识别为创建文件夹
+          target: "/tmp/"
 
       - name: Restart Service
         uses: appleboy/ssh-action@master
@@ -182,7 +208,8 @@ jobs:
           password: ${{ secrets.PASS_AMD64 }}
           script: |
             systemctl stop newapi.service
-            mv /tmp/new-api-amd64-upload /root/newapi/new-api-v0.9.27-patch.1
+            # 源文件现在位于 /tmp/new-api-amd64
+            mv /tmp/new-api-amd64 /root/newapi/new-api-v0.9.27-patch.1
             chmod +x /root/newapi/new-api-v0.9.27-patch.1
             systemctl restart newapi.service
             echo "AMD64 IPv4 Deployment Done!"
