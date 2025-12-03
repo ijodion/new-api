@@ -1,0 +1,187 @@
+name: Build and Deploy New-API
+
+on:
+  workflow_dispatch:
+
+jobs:
+  # ======================================================================================
+  # 任务 1: 编译 Linux armhf (Musl/Static) -> 发送到 IPv4 服务器
+  # ======================================================================================
+  deploy-armhf-musl:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Build Frontend
+        run: |
+          cd web
+          npm install
+          npm run build
+          cd ..
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: master
+
+      - name: Build Binary (Armv7 Musl)
+        run: |
+          CGO_ENABLED=1 GOOS=linux GOARCH=arm GOARM=7 CC="zig cc -target arm-linux-musleabihf" \
+          go build -ldflags "-s -w -extldflags '-static'" -o new-api-main .
+
+      - name: Deploy to Server (IPv4)
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.HOST_ARMHF }}
+          port: ${{ secrets.PORT_ARMHF }}
+          username: root
+          password: ${{ secrets.PASS_ARMHF }}
+          source: "new-api-main"
+          target: "/root/new-api/"
+          overwrite: true
+
+      - name: Restart Service
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.HOST_ARMHF }}
+          port: ${{ secrets.PORT_ARMHF }}
+          username: root
+          password: ${{ secrets.PASS_ARMHF }}
+          script: |
+            chmod +x /root/new-api/new-api-main
+            systemctl restart newapi.service
+            echo "ARMHF IPv4 Deployment Done!"
+
+  # ======================================================================================
+  # 任务 2: 编译 Linux arm64 -> 发送到 IPv6 单栈服务器 
+  # ======================================================================================
+  deploy-arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------
+      # 关键步骤：开启 IPv6 支持 (Cloudflare WARP)
+      # -----------------------------------------------------------
+      - name: Enable IPv6 (via WARP)
+        uses: fscarmen/warp-on-actions@v1.2
+        with:
+          stack: dual # 开启双栈，支持访问 IPv6
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Build Frontend
+        run: |
+          cd web
+          npm install
+          npm run build
+          cd ..
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: master
+
+      - name: Build Binary (Arm64)
+        run: |
+          CGO_ENABLED=1 GOOS=linux GOARCH=arm64 CC="zig cc -target aarch64-linux-gnu" \
+          go build -ldflags "-s -w" -o new-api-arm64-v0.9.27-patch.1 .
+
+      - name: Deploy to Server (IPv6)
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.HOST_ARM64 }}
+          port: ${{ secrets.PORT_ARM64 }}
+          username: root
+          password: ${{ secrets.PASS_ARM64 }}
+          source: "new-api-arm64-v0.9.27-patch.1"
+          target: "/root/newapi/"
+          overwrite: true
+          # 增加超时设置，防止IPv6路由建立初期连接缓慢
+          timeout: "30s"
+
+      - name: Restart Service
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.HOST_ARM64 }}
+          port: ${{ secrets.PORT_ARM64 }}
+          username: root
+          password: ${{ secrets.PASS_ARM64 }}
+          script: |
+            chmod +x /root/newapi/new-api-arm64-v0.9.27-patch.1
+            systemctl restart newapi.service
+            echo "ARM64 IPv6 Deployment Done!"
+
+  # ======================================================================================
+  # 任务 3: 编译 Linux amd64 -> 发送到 IPv4 服务器
+  # ======================================================================================
+  deploy-amd64:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Build Frontend
+        run: |
+          cd web
+          npm install
+          npm run build
+          cd ..
+
+      - name: Build Binary (AMD64)
+        run: |
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
+          go build -ldflags "-s -w" -o new-api-v0.9.27-patch.1 .
+
+      - name: Deploy to Server (IPv4)
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.HOST_AMD64 }}
+          port: ${{ secrets.PORT_AMD64 }}
+          username: root
+          password: ${{ secrets.PASS_AMD64 }}
+          source: "new-api-v0.9.27-patch.1"
+          target: "/root/newapi/"
+          overwrite: true
+
+      - name: Restart Service
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.HOST_AMD64 }}
+          port: ${{ secrets.PORT_AMD64 }}
+          username: root
+          password: ${{ secrets.PASS_AMD64 }}
+          script: |
+            chmod +x /root/newapi/new-api-v0.9.27-patch.1
+            systemctl restart newapi.service
+            echo "AMD64 IPv4 Deployment Done!"
