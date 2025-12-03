@@ -24,11 +24,16 @@ jobs:
           node-version: '18'
 
       # --- 修改点：增加 --legacy-peer-deps 解决依赖冲突 ---
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
       - name: Build Frontend
+        env:
+          CI: ""
         run: |
           cd web
-          npm install --legacy-peer-deps
-          npm run build
+          bun install
+          DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$VERSION bun run build
           cd ..
 
       - name: Setup Zig
