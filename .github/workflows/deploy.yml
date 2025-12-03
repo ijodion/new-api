@@ -6,6 +6,7 @@ on:
 jobs:
   # ======================================================================================
   # 任务 1: 编译 Linux armhf (Musl/Static) -> 发送到 IPv4 服务器
+  # 场景：目标服务器 Glibc 极老，必须使用全静态编译
   # ======================================================================================
   deploy-armhf-musl:
     runs-on: ubuntu-latest
@@ -16,11 +17,12 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25.5'
+          go-version: '1.25.5' # 建议使用稳定版 1.25.5 或 1.23
 
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+      
       - name: Build Frontend
         env:
           CI: ""
@@ -35,11 +37,15 @@ jobs:
         with:
           version: master
 
-      - name: Build Binary (Armv7 Musl)
+      # 关键修改：
+      # 1. CC 使用 musleabihf
+      # 2. ldflags 加入 "-linkmode external" 强制使用 Zig 进行链接，修复符号丢失问题
+      - name: Build Binary (Armv7 Musl Static)
         run: |
           CGO_ENABLED=1 GOOS=linux GOARCH=arm GOARM=7 CC="zig cc -target arm-linux-musleabihf" \
-          go build -ldflags "-s -w -extldflags '-static'" -o new-api-main .
+          go build -tags musl -ldflags "-s -w -linkmode external -extldflags '-static'" -o new-api-main .
 
+      # 使用临时文件名避免覆盖错误
       - name: Deploy to Server (IPv4)
         uses: appleboy/scp-action@master
         with:
@@ -48,8 +54,7 @@ jobs:
           username: root
           password: ${{ secrets.PASS_ARMHF }}
           source: "new-api-main"
-          target: "/root/new-api/"
-          overwrite: true
+          target: "/tmp/new-api-main-upload"
 
       - name: Restart Service
         uses: appleboy/ssh-action@master
@@ -59,12 +64,16 @@ jobs:
           username: root
           password: ${{ secrets.PASS_ARMHF }}
           script: |
+            systemctl stop newapi.service
+            # 移动覆盖
+            mv /tmp/new-api-main-upload /root/new-api/new-api-main
             chmod +x /root/new-api/new-api-main
             systemctl restart newapi.service
-            echo "ARMHF IPv4 Deployment Done!"
+            echo "ARMHF IPv4 (Static Musl) Deployment Done!"
 
   # ======================================================================================
   # 任务 2: 编译 Linux arm64 -> 发送到 IPv6 单栈服务器
+  # 场景：WARP 环境下 appleboy/scp-action DNS 解析失败，改用原生命令
   # ======================================================================================
   deploy-arm64:
     runs-on: ubuntu-latest
@@ -72,7 +81,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 开启 IPv6 支持
       - name: Enable IPv6 (via WARP)
         uses: fscarmen/warp-on-actions@v1.2
         with:
@@ -86,6 +94,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+          
       - name: Build Frontend
         env:
           CI: ""
@@ -94,7 +103,7 @@ jobs:
           bun install
           DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$VERSION bun run build
           cd ..
-
+          
       - name: Setup Zig
         uses: goto-bus-stop/setup-zig@v2
         with:
@@ -103,34 +112,27 @@ jobs:
       - name: Build Binary (Arm64)
         run: |
           CGO_ENABLED=1 GOOS=linux GOARCH=arm64 CC="zig cc -target aarch64-linux-gnu" \
-          go build -ldflags "-s -w" -o new-api-arm64-v0.9.27-patch.1 .
+          go build -ldflags "-s -w" -o new-api-arm64 .
 
-      - name: Deploy to Server (IPv6)
-        uses: appleboy/scp-action@master
-        with:
-          host: ${{ secrets.HOST_ARM64 }}
-          port: ${{ secrets.PORT_ARM64 }}
-          username: root
-          password: ${{ secrets.PASS_ARM64 }}
-          source: "new-api-arm64-v0.9.27-patch.1"
-          target: "/root/newapi/"
-          overwrite: true
-          timeout: "30s"
-
-      - name: Restart Service
-        uses: appleboy/ssh-action@master
-        with:
-          host: ${{ secrets.HOST_ARM64 }}
-          port: ${{ secrets.PORT_ARM64 }}
-          username: root
-          password: ${{ secrets.PASS_ARM64 }}
-          script: |
+      # 修正：使用原生 scp + sshpass
+      - name: Deploy to Server (IPv6 Native)
+        run: |
+          sudo apt-get update && sudo apt-get install -y sshpass
+          # 1. 传输到 /tmp
+          sshpass -p "${{ secrets.PASS_ARM64 }}" scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P ${{ secrets.PORT_ARM64 }} new-api-arm64 root@${{ secrets.HOST_ARM64 }}:/tmp/new-api-arm64-upload
+          
+          # 2. SSH 执行替换和重启
+          sshpass -p "${{ secrets.PASS_ARM64 }}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p ${{ secrets.PORT_ARM64 }} root@${{ secrets.HOST_ARM64 }} "
+            systemctl stop newapi.service
+            mv /tmp/new-api-arm64-upload /root/newapi/new-api-arm64-v0.9.27-patch.1
             chmod +x /root/newapi/new-api-arm64-v0.9.27-patch.1
             systemctl restart newapi.service
-            echo "ARM64 IPv6 Deployment Done!"
+            echo 'ARM64 IPv6 Deployment Done!'
+          "
 
   # ======================================================================================
   # 任务 3: 编译 Linux amd64 -> 发送到 IPv4 服务器
+  # 场景：解决 Text file busy
   # ======================================================================================
   deploy-amd64:
     runs-on: ubuntu-latest
@@ -146,6 +148,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+          
       - name: Build Frontend
         env:
           CI: ""
@@ -158,7 +161,7 @@ jobs:
       - name: Build Binary (AMD64)
         run: |
           CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
-          go build -ldflags "-s -w" -o new-api-v0.9.27-patch.1 .
+          go build -ldflags "-s -w" -o new-api-amd64 .
 
       - name: Deploy to Server (IPv4)
         uses: appleboy/scp-action@master
@@ -167,9 +170,8 @@ jobs:
           port: ${{ secrets.PORT_AMD64 }}
           username: root
           password: ${{ secrets.PASS_AMD64 }}
-          source: "new-api-v0.9.27-patch.1"
-          target: "/root/newapi/"
-          overwrite: true
+          source: "new-api-amd64"
+          target: "/tmp/new-api-amd64-upload"
 
       - name: Restart Service
         uses: appleboy/ssh-action@master
@@ -179,6 +181,8 @@ jobs:
           username: root
           password: ${{ secrets.PASS_AMD64 }}
           script: |
+            systemctl stop newapi.service
+            mv /tmp/new-api-amd64-upload /root/newapi/new-api-v0.9.27-patch.1
             chmod +x /root/newapi/new-api-v0.9.27-patch.1
             systemctl restart newapi.service
             echo "AMD64 IPv4 Deployment Done!"
