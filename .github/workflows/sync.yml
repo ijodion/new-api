@@ -1,0 +1,34 @@
+name: Upstream Sync
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch: # 只有手动点击 "Run workflow" 才会执行
+
+jobs:
+  sync_latest_from_upstream:
+    name: Sync latest commits from upstream repo
+    runs-on: ubuntu-latest
+    if: ${{ github.event.repository.fork }}
+
+    steps:
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+
+      - name: Sync upstream changes
+        id: sync
+        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4.1
+        with:
+          # ⚠️⚠️⚠️ 请修改这里，填入源作者的 "用户名/项目名"
+          upstream_sync_repo: QuantumNous/new-api
+          upstream_sync_branch: main
+          target_sync_branch: main
+          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
+          test_mode: false
+
+      - name: Sync check
+        if: failure()
+        run: |
+          echo "[Error] 同步失败，可能是源项目有冲突。"
+          exit 1
