@@ -1,8 +1,11 @@
 name: Build and Deploy New-API
 
 on:
-  workflow_dispatch:
-
+  workflow_dispatch: # 允许手动单独跑部署
+  workflow_run:      # 监听 Sync 任务
+    workflows: ["Upstream Sync"] # 必须和 sync.yml 里的 name 一模一样
+    types:
+      - completed
 jobs:
   # ======================================================================================
   # 任务 1: 编译 Linux armhf (Musl/Static) -> 压缩传输 (加速)
