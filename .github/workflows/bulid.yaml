@@ -1,0 +1,328 @@
+name: Build and Deploy New-API
+
+on:
+  workflow_dispatch: # 手动触发
+  schedule:
+    - cron: '0 2 * * *'  # 每天 UTC 02:00 自动同步+部署
+  workflow_run:      # 监听 Upstream Sync
+    workflows: ["Upstream Sync"]
+    types:
+      - completed
+
+jobs:
+  # ======================================================================================
+  # 任务 1: 编译 Linux armhf (Musl/Static) -> Gzip 压缩传输
+  # ======================================================================================
+  deploy-armhf:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync with Upstream
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git remote add upstream https://github.com/QuantumNous/new-api.git || true
+          git fetch upstream
+          if git merge-base --is-ancestor upstream/main HEAD 2>/dev/null; then
+            echo "✅ Already up-to-date with upstream/main"
+          else
+            echo "🔄 Merging upstream/main ..."
+            git merge upstream/main --no-edit -m "chore: auto-merge upstream $(date -u +%Y-%m-%d)" || {
+              echo "❌ Merge conflict! Please resolve manually in the fork."
+              exit 1
+            }
+            echo "✅ Successfully merged upstream"
+          fi
+
+      - name: Set Version
+        run: |
+          if [ -s VERSION ]; then
+            echo "VERSION=$(cat VERSION | tr -d '[:space:]')" >> $GITHUB_ENV
+          else
+            echo "VERSION=$(git describe --tags --always 2>/dev/null || echo 'dev')" >> $GITHUB_ENV
+          fi
+          echo "📦 VERSION=$VERSION"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.5'
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Build Frontend
+        env:
+          CI: ""
+        run: |
+          cd web
+          bun install
+          DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$VERSION bun run build
+          cd ..
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: master
+
+      - name: Build Binary (Armv7 Musl Static)
+        run: |
+          CGO_ENABLED=1 GOOS=linux GOARCH=arm GOARM=7 CC="zig cc -target arm-linux-musleabihf" \
+          go build -tags musl -ldflags "-s -w -linkmode external -extldflags '-static' -X 'github.com/QuantumNous/new-api/common.Version=$VERSION'" -o new-api-main .
+
+      - name: Compress Binary
+        run: |
+          gzip -9 -f new-api-main
+          ls -lh new-api-main.gz
+
+      - name: Deploy to Server (IPv4 - Compressed)
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.HOST_ARMHF }}
+          port: ${{ secrets.PORT_ARMHF }}
+          username: root
+          password: ${{ secrets.PASS_ARMHF }}
+          source: "new-api-main.gz"
+          target: "/tmp/"
+
+      - name: Restart Service
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.HOST_ARMHF }}
+          port: ${{ secrets.PORT_ARMHF }}
+          username: root
+          password: ${{ secrets.PASS_ARMHF }}
+          script: |
+            systemctl stop newapi.service || true
+            cd /tmp
+            rm -f new-api-main
+            gunzip -f new-api-main.gz
+            mv -f new-api-main /root/new-api/new-api-main
+            chmod +x /root/new-api/new-api-main
+            systemctl restart newapi.service
+            echo "✅ ARMHF Deployment Done! Version: $VERSION"
+
+  # ======================================================================================
+  # 任务 2: 编译 Linux arm64 (纯 IPv6 服务器)
+  # ======================================================================================
+  deploy-arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync with Upstream
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git remote add upstream https://github.com/QuantumNous/new-api.git || true
+          git fetch upstream
+          if git merge-base --is-ancestor upstream/main HEAD 2>/dev/null; then
+            echo "✅ Already up-to-date with upstream/main"
+          else
+            echo "🔄 Merging upstream/main ..."
+            git merge upstream/main --no-edit -m "chore: auto-merge upstream $(date -u +%Y-%m-%d)" || {
+              echo "❌ Merge conflict! Please resolve manually in the fork."
+              exit 1
+            }
+            echo "✅ Successfully merged upstream"
+          fi
+
+      - name: Enable IPv6 (via WARP)
+        uses: fscarmen/warp-on-actions@v1.4
+        with:
+          stack: dual
+
+      - name: Set Version
+        run: |
+          if [ -s VERSION ]; then
+            echo "VERSION=$(cat VERSION | tr -d '[:space:]')" >> $GITHUB_ENV
+          else
+            echo "VERSION=$(git describe --tags --always 2>/dev/null || echo 'dev')" >> $GITHUB_ENV
+          fi
+          echo "📦 VERSION=$VERSION"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.5'
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Build Frontend
+        env:
+          CI: ""
+        run: |
+          cd web
+          bun install
+          DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$VERSION bun run build
+          cd ..
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: master
+
+      - name: Build Binary (Arm64)
+        run: |
+          CGO_ENABLED=1 GOOS=linux GOARCH=arm64 CC="zig cc -target aarch64-linux-gnu" \
+          go build -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$VERSION'" -o new-api-arm64 .
+          gzip -9 -f new-api-arm64
+          ls -lh new-api-arm64.gz
+
+      - name: Resolve IPv6 & Deploy
+        env:
+          HOST: ${{ secrets.HOST_ARM64 }}
+          PORT: ${{ secrets.PORT_ARM64 }}
+          PASS: ${{ secrets.PASS_ARM64 }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sshpass dnsutils
+
+          # 1. 判断 HOST 是否已经是 IPv6 地址（推荐纯 IPv6 服务器直接把 IP 放进 secrets.HOST_ARM64）
+          if [[ "$HOST" =~ ^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$ ]]; then
+            SERVER_IP="$HOST"
+            echo "✅ Using provided IPv6 address: $SERVER_IP"
+          else
+            echo "🔍 Resolving AAAA for hostname: $HOST"
+            # 优先使用公共 DNS，避免 WARP 本地 resolver 返回 ::1
+            SERVER_IP=$(dig +short AAAA "$HOST" @1.1.1.1 | grep -E '^[0-9a-fA-F:]+$' | grep -v '^::1$' | tail -n1 || true)
+            if [ -z "$SERVER_IP" ]; then
+              SERVER_IP=$(dig +short AAAA "$HOST" @8.8.8.8 | grep -E '^[0-9a-fA-F:]+$' | grep -v '^::1$' | tail -n1 || true)
+            fi
+            if [ -z "$SERVER_IP" ]; then
+              SERVER_IP=$(getent ahostsv6 "$HOST" 2>/dev/null | awk '{print $1}' | grep -v '^::1$' | head -n1 || true)
+            fi
+
+            if [ -z "$SERVER_IP" ] || [ "$SERVER_IP" = "::1" ]; then
+              echo "❌ Error: Could not resolve a valid IPv6 address for '$HOST' (got: '$SERVER_IP')"
+              echo "💡 建议：把纯 IPv6 地址直接填入 secrets.HOST_ARM64，可完全跳过 DNS"
+              exit 1
+            fi
+            echo "✅ Resolved IPv6: $SERVER_IP"
+          fi
+
+          # 2. SCP（IPv6 必须带方括号 + -6）
+          echo "📂 Starting SCP to root@[$SERVER_IP] ..."
+          sshpass -p "$PASS" scp -6 \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=30 \
+            -P "$PORT" \
+            new-api-arm64.gz \
+            "root@[${SERVER_IP}]:/tmp/"
+
+          # 3. SSH 执行（IPv6 不加方括号 + -6）
+          echo "🚀 Starting SSH ..."
+          sshpass -p "$PASS" ssh -6 \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=30 \
+            -p "$PORT" \
+            "root@${SERVER_IP}" "
+              set -e
+              systemctl stop newapi.service || true
+              cd /tmp
+              gunzip -f new-api-arm64.gz
+              mv -f new-api-arm64 /root/newapi/new-api-arm64-v0.9.27-patch.1
+              chmod +x /root/newapi/new-api-arm64-v0.9.27-patch.1
+              systemctl restart newapi.service
+              echo '✅ ARM64 IPv6 Deployment Done!'
+            "
+
+  # ======================================================================================
+  # 任务 3: 编译 Linux amd64
+  # ======================================================================================
+  deploy-amd64:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync with Upstream
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git remote add upstream https://github.com/QuantumNous/new-api.git || true
+          git fetch upstream
+          if git merge-base --is-ancestor upstream/main HEAD 2>/dev/null; then
+            echo "✅ Already up-to-date with upstream/main"
+          else
+            echo "🔄 Merging upstream/main ..."
+            git merge upstream/main --no-edit -m "chore: auto-merge upstream $(date -u +%Y-%m-%d)" || {
+              echo "❌ Merge conflict! Please resolve manually in the fork."
+              exit 1
+            }
+            echo "✅ Successfully merged upstream"
+          fi
+
+      - name: Set Version
+        run: |
+          if [ -s VERSION ]; then
+            echo "VERSION=$(cat VERSION | tr -d '[:space:]')" >> $GITHUB_ENV
+          else
+            echo "VERSION=$(git describe --tags --always 2>/dev/null || echo 'dev')" >> $GITHUB_ENV
+          fi
+          echo "📦 VERSION=$VERSION"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.5'
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Build Frontend
+        env:
+          CI: ""
+        run: |
+          cd web
+          bun install
+          DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$VERSION bun run build
+          cd ..
+
+      - name: Build Binary (AMD64)
+        run: |
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
+          go build -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$VERSION'" -o new-api-amd64 .
+          gzip -9 -f new-api-amd64
+          ls -lh new-api-amd64.gz
+
+      - name: Deploy to Server (IPv4)
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.HOST_AMD64 }}
+          port: ${{ secrets.PORT_AMD64 }}
+          username: root
+          password: ${{ secrets.PASS_AMD64 }}
+          source: "new-api-amd64.gz"
+          target: "/tmp/"
+
+      - name: Restart Service
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.HOST_AMD64 }}
+          port: ${{ secrets.PORT_AMD64 }}
+          username: root
+          password: ${{ secrets.PASS_AMD64 }}
+          script: |
+            systemctl stop newapi.service || true
+            cd /tmp
+            gunzip -f new-api-amd64.gz
+            mv -f new-api-amd64 /root/newapi/new-api-v0.9.27-patch.1
+            chmod +x /root/newapi/new-api-v0.9.27-patch.1
+            systemctl restart newapi.service
+            echo "✅ AMD64 IPv4 Deployment Done!"
