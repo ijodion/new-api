@@ -2,8 +2,6 @@ name: Build and Deploy New-API
 
 on:
   workflow_dispatch: # 手动触发
-  schedule:
-    - cron: '0 2 * * *'  # 每天 UTC 02:00 自动同步+部署
   workflow_run:      # 监听 Upstream Sync
     workflows: ["Upstream Sync"]
     types:
