@@ -56,8 +56,14 @@ jobs:
         with:
           version: master
 
-      - name: Build Binary (Armv7 Musl Static)
+      - name: Patch 32-bit Int Overflow & Build Binary (Armv7 Musl Static)
         run: |
+          # 修复 32 位架构 (GOARCH=arm) 下 MaxWalletQuota 超出 int32 最大值导致编译失败的问题
+          if [ -f common/quota_math.go ]; then
+            sed -i -E 's/(MaxWalletQuota[[:space:]]*=[[:space:]]*).*/\12147483647/' common/quota_math.go
+            echo "✅ Patched MaxWalletQuota in common/quota_math.go for 32-bit build"
+          fi
+
           CGO_ENABLED=1 GOOS=linux GOARCH=arm GOARM=7 CC="zig cc -target arm-linux-musleabihf" \
           go build -tags musl -ldflags "-s -w -linkmode external -extldflags '-static' -X 'github.com/QuantumNous/new-api/common.Version=$VERSION'" -o new-api-main .
 
@@ -66,24 +72,38 @@ jobs:
           gzip -9 -f new-api-main
           ls -lh new-api-main.gz
 
-      - name: Deploy to Server (IPv4 - Compressed)
-        uses: appleboy/scp-action@master
-        with:
-          host: ${{ secrets.HOST_ARMHF }}
-          port: ${{ secrets.PORT_ARMHF }}
-          username: root
-          password: ${{ secrets.PASS_ARMHF }}
-          source: "new-api-main.gz"
-          target: "/tmp/"
+      - name: Deploy & Restart (ARMHF with Retry)
+        env:
+          HOST: ${{ secrets.HOST_ARMHF }}
+          PORT: ${{ secrets.PORT_ARMHF }}
+          PASS: ${{ secrets.PASS_ARMHF }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sshpass
 
-      - name: Restart Service
-        uses: appleboy/ssh-action@master
-        with:
-          host: ${{ secrets.HOST_ARMHF }}
-          port: ${{ secrets.PORT_ARMHF }}
-          username: root
-          password: ${{ secrets.PASS_ARMHF }}
-          script: |
+          HOST_CLEAN=$(echo "$HOST" | tr -d '[:space:]')
+          PORT_CLEAN=$(echo "$PORT" | tr -d '[:space:]')
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive -o ServerAliveInterval=15 -o ConnectTimeout=30"
+
+          UPLOAD_OK=0
+          for i in 1 2 3; do
+            echo "📂 [Attempt $i/3] Uploading new-api-main.gz to ARMHF server..."
+            if sshpass -p "$PASS" scp $SSH_OPTS -P "$PORT_CLEAN" new-api-main.gz "root@${HOST_CLEAN}:/tmp/"; then
+              UPLOAD_OK=1
+              break
+            fi
+            echo "⚠️ Upload failed, retrying in 5 seconds..."
+            sleep 5
+          done
+
+          if [ "$UPLOAD_OK" -ne 1 ]; then
+            echo "❌ Failed to upload binary after 3 attempts."
+            exit 1
+          fi
+
+          echo "🚀 Restarting service on ARMHF server..."
+          sshpass -p "$PASS" ssh $SSH_OPTS -p "$PORT_CLEAN" "root@${HOST_CLEAN}" "
+            set -e
             systemctl stop newapi.service || true
             cd /tmp
             rm -f new-api-main
@@ -91,7 +111,8 @@ jobs:
             mv -f new-api-main /root/new-api/new-api-main
             chmod +x /root/new-api/new-api-main
             systemctl restart newapi.service
-            echo "✅ ARMHF Deployment Done! Version: $VERSION"
+            echo '✅ ARMHF Deployment Done! Version: $VERSION'
+          "
 
   # ======================================================================================
   # 任务 2: 编译 Linux arm64 (纯 IPv6 服务器)
@@ -174,71 +195,69 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y sshpass dnsutils
 
-          # 1. 规范化 HOST（允许 secrets.HOST_ARM64 使用 [IPv6] 形式）
-          HOST_CLEAN="${HOST#[}"
-          HOST_CLEAN="${HOST_CLEAN%]}"
+          # 1. 清理首尾空白字符、换行符以及可能包含的方括号
+          HOST_CLEAN=$(echo "$HOST" | tr -d '[:space:][]')
+          PORT_CLEAN=$(echo "$PORT" | tr -d '[:space:]')
 
-          # 2. 判断 HOST 是否已经是 IPv6 地址（推荐纯 IPv6 服务器直接把 IP 放进 secrets.HOST_ARM64）
-          if [[ "$HOST_CLEAN" =~ ^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$ ]]; then
+          # 2. 判断是否直接提供了 IPv6 地址（包含冒号即为 IPv6，兼容 :: 缩写格式）
+          if [[ "$HOST_CLEAN" == *:* ]]; then
             SERVER_IP="$HOST_CLEAN"
             echo "✅ Using provided IPv6 address: $SERVER_IP"
           else
             echo "🔍 Resolving AAAA for hostname: $HOST_CLEAN"
-            # 优先使用公共 DNS，避免 WARP 本地 resolver 返回 ::1
-            SERVER_IP=$(dig +short AAAA "$HOST_CLEAN" @1.1.1.1 | grep -E '^[0-9a-fA-F:]+$' | grep -v '^::1$' | tail -n1 || true)
+            # 依次通过 DoH/TCP DNS、公共 DNS 和系统解析器获取 AAAA，过滤 CNAME 行
+            SERVER_IP=$(dig +tcp +short AAAA "$HOST_CLEAN" @1.1.1.1 2>/dev/null | grep ':' | grep -v '^::1$' | tail -n1 || true)
             if [ -z "$SERVER_IP" ]; then
-              SERVER_IP=$(dig +short AAAA "$HOST_CLEAN" @8.8.8.8 | grep -E '^[0-9a-fA-F:]+$' | grep -v '^::1$' | tail -n1 || true)
+              SERVER_IP=$(dig +tcp +short AAAA "$HOST_CLEAN" @8.8.8.8 2>/dev/null | grep ':' | grep -v '^::1$' | tail -n1 || true)
             fi
             if [ -z "$SERVER_IP" ]; then
-              SERVER_IP=$(getent ahostsv6 "$HOST_CLEAN" 2>/dev/null | awk '{print $1}' | grep -v '^::1$' | head -n1 || true)
-            fi
-
-            if [ -z "$SERVER_IP" ] || [ "$SERVER_IP" = "::1" ]; then
-              echo "⚠️ Warning: Could not resolve AAAA for '$HOST_CLEAN'. Falling back to direct host."
-              SERVER_SCP_TARGET="root@${HOST_CLEAN}:/tmp/"
-              SERVER_SSH_TARGET="root@${HOST_CLEAN}"
-              SSH_FAMILY_ARG=""
-            else
-              echo "✅ Resolved IPv6: $SERVER_IP"
-              SERVER_SCP_TARGET="root@[${SERVER_IP}]:/tmp/"
-              SERVER_SSH_TARGET="root@${SERVER_IP}"
-              SSH_FAMILY_ARG="-6"
+              SERVER_IP=$(python3 -c "import socket; print(socket.getaddrinfo('$HOST_CLEAN', None, socket.AF_INET6)[0][4][0])" 2>/dev/null || true)
             fi
           fi
 
-          if [ -z "${SERVER_SCP_TARGET:-}" ] || [ -z "${SERVER_SSH_TARGET:-}" ]; then
+          # 3. 构造 SCP 与 SSH 目标参数（始终强制使用 -6 防止回退到错误的 IPv4 宿主机）
+          if [ -n "${SERVER_IP:-}" ] && [ "$SERVER_IP" != "::1" ]; then
+            echo "✅ Target IPv6: $SERVER_IP"
             SERVER_SCP_TARGET="root@[${SERVER_IP}]:/tmp/"
             SERVER_SSH_TARGET="root@${SERVER_IP}"
-            SSH_FAMILY_ARG="-6"
+          else
+            echo "⚠️ Could not pre-resolve AAAA, forcing SSH/SCP -6 directly on host."
+            SERVER_SCP_TARGET="root@${HOST_CLEAN}:/tmp/"
+            SERVER_SSH_TARGET="root@${HOST_CLEAN}"
           fi
 
-          # 3. SCP（IPv6 必须带方括号 + -6；域名回退时使用原始 host）
-          echo "📂 Starting SCP to $SERVER_SCP_TARGET ..."
-          sshpass -p "$PASS" scp ${SSH_FAMILY_ARG:+$SSH_FAMILY_ARG} \
-            -o StrictHostKeyChecking=no \
-            -o UserKnownHostsFile=/dev/null \
-            -o ConnectTimeout=30 \
-            -P "$PORT" \
-            new-api-arm64.gz \
-            "$SERVER_SCP_TARGET"
+          # 禁用公钥尝试，强制直接使用密码认证，避免触发 MaxAuthTries 或 Permission denied
+          SSH_OPTS="-6 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive -o ServerAliveInterval=15 -o ConnectTimeout=30"
 
-          # 4. SSH 执行（IPv6 不加方括号 + -6）
+          # 4. SCP 上传（带 3 次重试）
+          UPLOAD_OK=0
+          for i in 1 2 3; do
+            echo "📂 [Attempt $i/3] Starting SCP to $SERVER_SCP_TARGET ..."
+            if sshpass -p "$PASS" scp $SSH_OPTS -P "$PORT_CLEAN" new-api-arm64.gz "$SERVER_SCP_TARGET"; then
+              UPLOAD_OK=1
+              break
+            fi
+            echo "⚠️ SCP failed, retrying in 5 seconds..."
+            sleep 5
+          done
+
+          if [ "$UPLOAD_OK" -ne 1 ]; then
+            echo "❌ Failed to SCP to ARM64 server after 3 attempts."
+            exit 1
+          fi
+
+          # 5. SSH 重启服务
           echo "🚀 Starting SSH ..."
-          sshpass -p "$PASS" ssh ${SSH_FAMILY_ARG:+$SSH_FAMILY_ARG} \
-            -o StrictHostKeyChecking=no \
-            -o UserKnownHostsFile=/dev/null \
-            -o ConnectTimeout=30 \
-            -p "$PORT" \
-            "$SERVER_SSH_TARGET" "
-              set -e
-              systemctl stop newapi.service || true
-              cd /tmp
-              gunzip -f new-api-arm64.gz
-              mv -f new-api-arm64 /root/newapi/new-api-arm64-v0.9.27-patch.1
-              chmod +x /root/newapi/new-api-arm64-v0.9.27-patch.1
-              systemctl restart newapi.service
-              echo '✅ ARM64 IPv6 Deployment Done!'
-            "
+          sshpass -p "$PASS" ssh $SSH_OPTS -p "$PORT_CLEAN" "$SERVER_SSH_TARGET" "
+            set -e
+            systemctl stop newapi.service || true
+            cd /tmp
+            gunzip -f new-api-arm64.gz
+            mv -f new-api-arm64 /root/newapi/new-api-arm64-v0.9.27-patch.1
+            chmod +x /root/newapi/new-api-arm64-v0.9.27-patch.1
+            systemctl restart newapi.service
+            echo '✅ ARM64 IPv6 Deployment Done!'
+          "
 
   # ======================================================================================
   # 任务 3: 编译 Linux amd64
@@ -302,28 +321,44 @@ jobs:
           gzip -9 -f new-api-amd64
           ls -lh new-api-amd64.gz
 
-      - name: Deploy to Server (IPv4)
-        uses: appleboy/scp-action@master
-        with:
-          host: ${{ secrets.HOST_AMD64 }}
-          port: ${{ secrets.PORT_AMD64 }}
-          username: root
-          password: ${{ secrets.PASS_AMD64 }}
-          source: "new-api-amd64.gz"
-          target: "/tmp/"
+      - name: Deploy & Restart (AMD64 with Retry)
+        env:
+          HOST: ${{ secrets.HOST_AMD64 }}
+          PORT: ${{ secrets.PORT_AMD64 }}
+          PASS: ${{ secrets.PASS_AMD64 }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sshpass
 
-      - name: Restart Service
-        uses: appleboy/ssh-action@master
-        with:
-          host: ${{ secrets.HOST_AMD64 }}
-          port: ${{ secrets.PORT_AMD64 }}
-          username: root
-          password: ${{ secrets.PASS_AMD64 }}
-          script: |
+          HOST_CLEAN=$(echo "$HOST" | tr -d '[:space:]')
+          PORT_CLEAN=$(echo "$PORT" | tr -d '[:space:]')
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive -o ServerAliveInterval=15 -o ConnectTimeout=30"
+
+          # 替换不稳定的 drone-scp，使用带重试的原生 OpenSSH
+          UPLOAD_OK=0
+          for i in 1 2 3; do
+            echo "📂 [Attempt $i/3] Uploading new-api-amd64.gz to AMD64 server..."
+            if sshpass -p "$PASS" scp $SSH_OPTS -P "$PORT_CLEAN" new-api-amd64.gz "root@${HOST_CLEAN}:/tmp/"; then
+              UPLOAD_OK=1
+              break
+            fi
+            echo "⚠️ Upload failed (connection reset/timeout), retrying in 5 seconds..."
+            sleep 5
+          done
+
+          if [ "$UPLOAD_OK" -ne 1 ]; then
+            echo "❌ Failed to upload binary to AMD64 server after 3 attempts."
+            exit 1
+          fi
+
+          echo "🚀 Restarting service on AMD64 server..."
+          sshpass -p "$PASS" ssh $SSH_OPTS -p "$PORT_CLEAN" "root@${HOST_CLEAN}" "
+            set -e
             systemctl stop newapi.service || true
             cd /tmp
             gunzip -f new-api-amd64.gz
             mv -f new-api-amd64 /root/newapi/new-api-v0.9.27-patch.1
             chmod +x /root/newapi/new-api-v0.9.27-patch.1
             systemctl restart newapi.service
-            echo "✅ AMD64 IPv4 Deployment Done!"
+            echo '✅ AMD64 IPv4 Deployment Done!'
+          "
