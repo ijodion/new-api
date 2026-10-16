@@ -186,47 +186,59 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y sshpass dnsutils
 
-          # 1. 判断 HOST 是否已经是 IPv6 地址（推荐纯 IPv6 服务器直接把 IP 放进 secrets.HOST_ARM64）
-          if [[ "$HOST" =~ ^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$ ]]; then
-            SERVER_IP="$HOST"
+          # 1. 规范化 HOST（允许 secrets.HOST_ARM64 使用 [IPv6] 形式）
+          HOST_CLEAN="${HOST#[}"
+          HOST_CLEAN="${HOST_CLEAN%]}"
+
+          # 2. 判断 HOST 是否已经是 IPv6 地址（推荐纯 IPv6 服务器直接把 IP 放进 secrets.HOST_ARM64）
+          if [[ "$HOST_CLEAN" =~ ^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$ ]]; then
+            SERVER_IP="$HOST_CLEAN"
             echo "✅ Using provided IPv6 address: $SERVER_IP"
           else
-            echo "🔍 Resolving AAAA for hostname: $HOST"
+            echo "🔍 Resolving AAAA for hostname: $HOST_CLEAN"
             # 优先使用公共 DNS，避免 WARP 本地 resolver 返回 ::1
-            SERVER_IP=$(dig +short AAAA "$HOST" @1.1.1.1 | grep -E '^[0-9a-fA-F:]+$' | grep -v '^::1$' | tail -n1 || true)
+            SERVER_IP=$(dig +short AAAA "$HOST_CLEAN" @1.1.1.1 | grep -E '^[0-9a-fA-F:]+$' | grep -v '^::1$' | tail -n1 || true)
             if [ -z "$SERVER_IP" ]; then
-              SERVER_IP=$(dig +short AAAA "$HOST" @8.8.8.8 | grep -E '^[0-9a-fA-F:]+$' | grep -v '^::1$' | tail -n1 || true)
+              SERVER_IP=$(dig +short AAAA "$HOST_CLEAN" @8.8.8.8 | grep -E '^[0-9a-fA-F:]+$' | grep -v '^::1$' | tail -n1 || true)
             fi
             if [ -z "$SERVER_IP" ]; then
-              SERVER_IP=$(getent ahostsv6 "$HOST" 2>/dev/null | awk '{print $1}' | grep -v '^::1$' | head -n1 || true)
+              SERVER_IP=$(getent ahostsv6 "$HOST_CLEAN" 2>/dev/null | awk '{print $1}' | grep -v '^::1$' | head -n1 || true)
             fi
 
             if [ -z "$SERVER_IP" ] || [ "$SERVER_IP" = "::1" ]; then
-              echo "❌ Error: Could not resolve a valid IPv6 address for '$HOST' (got: '$SERVER_IP')"
-              echo "💡 建议：把纯 IPv6 地址直接填入 secrets.HOST_ARM64，可完全跳过 DNS"
-              exit 1
+              echo "⚠️ Warning: Could not resolve AAAA for '$HOST_CLEAN'. Falling back to direct host."
+              SERVER_SCP_TARGET="root@${HOST_CLEAN}:/tmp/"
+              SERVER_SSH_TARGET="root@${HOST_CLEAN}"
+            else
+              echo "✅ Resolved IPv6: $SERVER_IP"
+              SERVER_SCP_TARGET="root@[${SERVER_IP}]:/tmp/"
+              SERVER_SSH_TARGET="root@${SERVER_IP}"
             fi
-            echo "✅ Resolved IPv6: $SERVER_IP"
           fi
 
-          # 2. SCP（IPv6 必须带方括号 + -6）
-          echo "📂 Starting SCP to root@[$SERVER_IP] ..."
+          if [ -z "${SERVER_SCP_TARGET:-}" ] || [ -z "${SERVER_SSH_TARGET:-}" ]; then
+            SERVER_SCP_TARGET="root@[${SERVER_IP}]:/tmp/"
+            SERVER_SSH_TARGET="root@${SERVER_IP}"
+          fi
+
+          # 3. SCP（IPv6 必须带方括号 + -6；域名回退时使用原始 host）
+          echo "📂 Starting SCP to $SERVER_SCP_TARGET ..."
           sshpass -p "$PASS" scp -6 \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             -o ConnectTimeout=30 \
             -P "$PORT" \
             new-api-arm64.gz \
-            "root@[${SERVER_IP}]:/tmp/"
+            "$SERVER_SCP_TARGET"
 
-          # 3. SSH 执行（IPv6 不加方括号 + -6）
+          # 4. SSH 执行（IPv6 不加方括号 + -6）
           echo "🚀 Starting SSH ..."
           sshpass -p "$PASS" ssh -6 \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             -o ConnectTimeout=30 \
             -p "$PORT" \
-            "root@${SERVER_IP}" "
+            "$SERVER_SSH_TARGET" "
               set -e
               systemctl stop newapi.service || true
               cd /tmp
