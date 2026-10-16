@@ -197,21 +197,24 @@ jobs:
               echo "⚠️ Warning: Could not resolve AAAA for '$HOST_CLEAN'. Falling back to direct host."
               SERVER_SCP_TARGET="root@${HOST_CLEAN}:/tmp/"
               SERVER_SSH_TARGET="root@${HOST_CLEAN}"
+              SSH_FAMILY_ARG=""
             else
               echo "✅ Resolved IPv6: $SERVER_IP"
               SERVER_SCP_TARGET="root@[${SERVER_IP}]:/tmp/"
               SERVER_SSH_TARGET="root@${SERVER_IP}"
+              SSH_FAMILY_ARG="-6"
             fi
           fi
 
           if [ -z "${SERVER_SCP_TARGET:-}" ] || [ -z "${SERVER_SSH_TARGET:-}" ]; then
             SERVER_SCP_TARGET="root@[${SERVER_IP}]:/tmp/"
             SERVER_SSH_TARGET="root@${SERVER_IP}"
+            SSH_FAMILY_ARG="-6"
           fi
 
           # 3. SCP（IPv6 必须带方括号 + -6；域名回退时使用原始 host）
           echo "📂 Starting SCP to $SERVER_SCP_TARGET ..."
-          sshpass -p "$PASS" scp -6 \
+          sshpass -p "$PASS" scp ${SSH_FAMILY_ARG:+$SSH_FAMILY_ARG} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             -o ConnectTimeout=30 \
@@ -221,7 +224,7 @@ jobs:
 
           # 4. SSH 执行（IPv6 不加方括号 + -6）
           echo "🚀 Starting SSH ..."
-          sshpass -p "$PASS" ssh -6 \
+          sshpass -p "$PASS" ssh ${SSH_FAMILY_ARG:+$SSH_FAMILY_ARG} \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             -o ConnectTimeout=30 \
